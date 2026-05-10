@@ -8,9 +8,19 @@ export type ProviderInput = {
   task: TaskName;
   observation: SymbolicObservation;
   iteration: number;
+  runTarget?: ProviderRunTarget;
   retry?: number;
   validationErrors?: StructuredError[];
   previousOutputs?: unknown[];
+};
+
+export type ProviderRunTarget = {
+  kind: "inventory_increment";
+  task: TaskName;
+  item: string;
+  startingCount: number;
+  requiredCount: number;
+  increment: number;
 };
 
 export type PromptMessage = {
@@ -96,7 +106,7 @@ export class ScriptedProvider implements ModelProvider {
   }
 
   async nextToolCall(input: ProviderInput): Promise<ToolCall> {
-    return scriptedCall(input.task, input.observation);
+    return scriptedCall(input);
   }
 }
 
@@ -309,7 +319,9 @@ function buildSystemPrompt(): string {
     "craft_item {\"item\":\"stick\",\"count\":4}",
     "craft_item {\"item\":\"crafting_table\",\"count\":1}",
     "craft_item {\"item\":\"wooden_pickaxe\",\"count\":1}",
+    "craft_item {\"item\":\"stone_pickaxe\",\"count\":1}",
     "equip_item {\"item\":\"wooden_pickaxe\"}",
+    "mine_block {\"block\":\"stone\",\"count\":1,\"maxDistance\":128}",
     "place_block {\"item\":\"crafting_table\",\"referenceBlock\":\"grass_block\",\"maxDistance\":4}",
     "smelt_item {\"input\":\"raw_iron\",\"fuel\":\"coal\",\"count\":1,\"maxDistance\":8}",
     "eat_food {}",
@@ -323,9 +335,18 @@ function buildUserPrompt(input: ProviderInput): string {
   return [
     `Task: ${input.task}`,
     taskObjective(input.task),
+    formatRunTarget(input.runTarget),
     formatObservation(input.observation),
     feedback,
   ].filter(Boolean).join("\n\n");
+}
+
+function formatRunTarget(target: ProviderRunTarget | undefined): string | undefined {
+  if (!target) return undefined;
+  return [
+    `Run target: increase ${target.item} from ${target.startingCount} to at least ${target.requiredCount}.`,
+    "Do not stop just because the task was already satisfied before this run.",
+  ].join(" ");
 }
 
 function taskObjective(task: TaskName): string {
@@ -342,6 +363,22 @@ function taskObjective(task: TaskName): string {
       "If a crafting_table is nearby and you have at least 3 planks and 2 sticks, craft_item wooden_pickaxe.",
       "Stop only when all required evidence is satisfied.",
       "Choose one valid tool call that directly improves a missing requirement.",
+    ].join(" ");
+  }
+  if (task === "mine_cobblestone") {
+    return [
+      "Objective: mine at least one cobblestone from stone.",
+      "Stone must be harvested with a wooden or better pickaxe; craft a wooden_pickaxe first if none is available.",
+      "The mine_block tool will equip a suitable pickaxe from inventory before digging stone.",
+      "Stop only when cobblestone appears in inventory.",
+    ].join(" ");
+  }
+  if (task === "craft_stone_pickaxe") {
+    return [
+      "Objective: craft a stone_pickaxe.",
+      "If cobblestone is below 3, first mine stone with a wooden or better pickaxe until enough cobblestone is in inventory.",
+      "Ensure at least 2 sticks and a nearby crafting_table before crafting stone_pickaxe.",
+      "Stop only when stone_pickaxe appears in inventory.",
     ].join(" ");
   }
   return "Objective: choose one valid tool call that directly improves the task score.";
@@ -374,13 +411,17 @@ function isProviderKind(value: string): value is ProviderKind {
   return value === "scripted" || value === "openai-compatible" || value === "gemini-compatible";
 }
 
-function scriptedCall(task: TaskName, observation: SymbolicObservation): ToolCall {
+function scriptedCall(input: ProviderInput): ToolCall {
+  const { task, observation } = input;
   const logCount = countInventory(observation.inventory, "log");
   const plankCount = countInventory(observation.inventory, "planks");
   const stickCount = countInventory(observation.inventory, "stick");
   const tableCount = countInventory(observation.inventory, "crafting_table");
   const tablePlaced = observation.nearbyBlocks.some((block) => block.name === "crafting_table");
   const woodenPickaxeCount = countInventory(observation.inventory, "wooden_pickaxe");
+  const pickaxeCount = countInventory(observation.inventory, "pickaxe");
+  const cobblestoneCount = countInventory(observation.inventory, "cobblestone");
+  const stonePickaxeCount = countInventory(observation.inventory, "stone_pickaxe");
 
   if (task === "collect_logs") return logCount >= 3 ? stop("logs collected") : mine("log");
   if (task === "craft_planks") {
@@ -399,12 +440,20 @@ function scriptedCall(task: TaskName, observation: SymbolicObservation): ToolCal
   }
   if (task === "craft_wooden_pickaxe") return pickaxeStep(observation);
 
-  if (task === "mine_cobblestone") return countInventory(observation.inventory, "cobblestone") >= 1
-    ? stop("cobblestone mined")
-    : mine("stone");
-  if (task === "craft_stone_pickaxe") return countInventory(observation.inventory, "stone_pickaxe") >= 1
-    ? stop("stone pickaxe crafted")
-    : craft("stone_pickaxe");
+  if (task === "mine_cobblestone") {
+    const requiredCobblestone = input.runTarget?.item === "cobblestone"
+      ? input.runTarget.requiredCount
+      : 1;
+    if (cobblestoneCount >= requiredCobblestone) return stop("cobblestone mined");
+    return pickaxeCount >= 1 ? mine("stone") : pickaxeStep(observation);
+  }
+  if (task === "craft_stone_pickaxe") {
+    if (stonePickaxeCount >= 1) return stop("stone pickaxe crafted");
+    if (cobblestoneCount < 3) return pickaxeCount >= 1 ? mine("stone") : pickaxeStep(observation);
+    if (stickCount < 2) return plankCount >= 2 ? craft("stick", 4) : (logCount > 0 ? craft("planks", 4) : mine("log"));
+    if (!tablePlaced) return tableCount >= 1 ? place("crafting_table") : craft("crafting_table");
+    return craft("stone_pickaxe");
+  }
   if (task === "place_furnace") {
     if (observation.nearbyBlocks.some((block) => block.name === "furnace")) return stop("furnace placed");
     if (countInventory(observation.inventory, "furnace") >= 1) return place("furnace");

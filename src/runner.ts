@@ -3,6 +3,7 @@ import { join } from "node:path";
 import type { Bot } from "mineflayer";
 import type { AppConfig } from "./config.js";
 import { errorMessage, failedResult, structuredError } from "./errors.js";
+import { countInventory } from "./inventory.js";
 import { buildObservation, formatObservation } from "./observation.js";
 import {
   createProvider,
@@ -10,10 +11,11 @@ import {
   type ModelProvider,
   type ModelRoute,
   type ProviderInput,
+  type ProviderRunTarget,
 } from "./provider.js";
 import { scoreTask } from "./tasks.js";
 import { withTimeout } from "./timeout.js";
-import type { RunControlState, StructuredError, TaskScore, ToolResult } from "./types.js";
+import type { RunControlState, StructuredError, SymbolicObservation, TaskName, TaskScore, ToolResult } from "./types.js";
 import { executeTool } from "./tools/execute.js";
 import { validateToolCall, type ToolCall } from "./tools/schema.js";
 
@@ -106,13 +108,15 @@ export async function runTask(
   let finalScore: TaskScore | undefined;
   let finalStatus: "complete" | "stopped" = "complete";
   let lockedFallback: FallbackDecision | undefined;
+  const initialObservation = buildObservation(bot, state.lastActionResult);
+  const runTarget = runTargetForTask(config.task, initialObservation);
   await mkdir(config.logDir, { recursive: true });
   const logPath = options.logPath
     ?? join(config.logDir, `${new Date().toISOString().replace(/[:.]/g, "-")}_${config.task}.json`);
 
   for (let iteration = 0; iteration < config.maxIterations; iteration += 1) {
-    const observation = buildObservation(bot, state.lastActionResult);
-    const score = scoreTask(config.task, observation);
+    const observation = iteration === 0 ? initialObservation : buildObservation(bot, state.lastActionResult);
+    const score = scoreRunTask(config.task, observation, runTarget);
     finalScore = score;
     const event: RunEvent = {
       iteration,
@@ -122,7 +126,7 @@ export async function runTask(
       inventoryBefore: observation.inventory,
     };
     events.push(event);
-    await writeRunLogSnapshot(logPath, config, startedAt, startedMs, events, state, bot, "running");
+    await writeRunLogSnapshot(logPath, config, startedAt, startedMs, events, state, bot, "running", runTarget);
 
     if (score.complete || bot.health <= 0) break;
     if (state.stopRequested) {
@@ -137,7 +141,7 @@ export async function runTask(
       break;
     }
 
-    const providerInput = { task: config.task, observation, iteration };
+    const providerInput = { task: config.task, observation, iteration, runTarget };
     const decisionTimeoutMs = llmDecisionBudgetMs(config, lockedFallback);
     const decision = await withTimeout(
       chooseToolCallWithPolicy(config, providerInput, createProvider, lockedFallback),
@@ -195,8 +199,8 @@ export async function runTask(
     event.toolResult = state.lastActionResult;
     const observationAfter = buildObservation(bot, state.lastActionResult);
     event.inventoryAfter = observationAfter.inventory;
-    event.scoreAfter = scoreTask(config.task, observationAfter);
-    await writeRunLogSnapshot(logPath, config, startedAt, startedMs, events, state, bot, "running");
+    event.scoreAfter = scoreRunTask(config.task, observationAfter, runTarget);
+    await writeRunLogSnapshot(logPath, config, startedAt, startedMs, events, state, bot, "running", runTarget);
 
     if (state.stopRequested || state.lastActionResult.error?.code === "stopped") {
       finalStatus = "stopped";
@@ -204,9 +208,48 @@ export async function runTask(
     }
   }
 
-  finalScore = await writeRunLogSnapshot(logPath, config, startedAt, startedMs, events, state, bot, finalStatus);
+  finalScore = await writeRunLogSnapshot(logPath, config, startedAt, startedMs, events, state, bot, finalStatus, runTarget);
 
   return { logPath, score: finalScore, status: finalStatus };
+}
+
+function runTargetForTask(task: TaskName, observation: SymbolicObservation): ProviderRunTarget | undefined {
+  if (task !== "mine_cobblestone") return undefined;
+
+  const startingCount = countInventory(observation.inventory, "cobblestone");
+  if (startingCount < 1) return undefined;
+
+  return {
+    kind: "inventory_increment",
+    task,
+    item: "cobblestone",
+    startingCount,
+    requiredCount: startingCount + 1,
+    increment: 1,
+  };
+}
+
+function scoreRunTask(
+  task: TaskName,
+  observation: SymbolicObservation,
+  runTarget: ProviderRunTarget | undefined,
+): TaskScore {
+  if (!runTarget) return scoreTask(task, observation);
+
+  const count = countInventory(observation.inventory, runTarget.item);
+  const progress = count - runTarget.startingCount;
+  return {
+    task,
+    complete: count >= runTarget.requiredCount,
+    score: Math.max(0, Math.min(1, progress / runTarget.increment)),
+    evidence: {
+      item: runTarget.item,
+      count,
+      startingCount: runTarget.startingCount,
+      required: runTarget.requiredCount,
+      increment: runTarget.increment,
+    },
+  };
 }
 
 async function writeRunLogSnapshot(
@@ -218,9 +261,10 @@ async function writeRunLogSnapshot(
   state: { lastActionResult?: ToolResult },
   bot: Bot,
   status: "running" | "complete" | "stopped",
+  runTarget?: ProviderRunTarget,
 ): Promise<TaskScore> {
   const finalObservation = buildObservation(bot, state.lastActionResult);
-  const finalScore = scoreTask(config.task, finalObservation);
+  const finalScore = scoreRunTask(config.task, finalObservation, runTarget);
   const elapsedMs = Date.now() - startedMs;
   const endedAt = new Date();
   const summary = runSummary(events, finalScore, elapsedMs);
@@ -246,6 +290,7 @@ async function writeRunLogSnapshot(
       task: config.task,
       maxIterations: config.maxIterations,
     },
+    runTarget,
     benchmarkEvidence: benchmarkEvidence(events, finalScore),
     summary,
     events,

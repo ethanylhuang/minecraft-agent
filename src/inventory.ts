@@ -30,11 +30,22 @@ const WOODEN_PICKAXES = [
   "wooden_pickaxe",
 ];
 
+const PICKAXES = [
+  "wooden_pickaxe",
+  "stone_pickaxe",
+  "iron_pickaxe",
+  "golden_pickaxe",
+  "diamond_pickaxe",
+  "netherite_pickaxe",
+];
+
 export const ITEM_ALIASES: Record<string, string[]> = {
   log: LOGS,
   logs: LOGS,
   plank: PLANKS,
   planks: PLANKS,
+  pickaxe: PICKAXES,
+  pickaxes: PICKAXES,
   wooden_pick: WOODEN_PICKAXES,
   wooden_pickaxe: WOODEN_PICKAXES,
 };

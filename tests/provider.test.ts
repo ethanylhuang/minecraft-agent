@@ -94,6 +94,88 @@ describe("provider prompts", () => {
     expect(reference.observationText).toContain("Inventory: empty");
   });
 
+  it("scripts cobblestone mining through a pickaxe prerequisite", async () => {
+    const provider = new ScriptedProvider();
+
+    await expect(provider.nextToolCall({
+      task: "mine_cobblestone",
+      observation: {
+        ...observation,
+        inventory: [{ name: "wooden_pickaxe", count: 1 }],
+      },
+      iteration: 0,
+    })).resolves.toEqual({ tool: "mine_block", args: { block: "stone", count: 1, maxDistance: 128 } });
+
+    await expect(provider.nextToolCall({
+      task: "mine_cobblestone",
+      observation,
+      iteration: 0,
+    })).resolves.toEqual({ tool: "mine_block", args: { block: "log", count: 1, maxDistance: 128 } });
+  });
+
+  it("keeps mining cobblestone until the run increment target is met", async () => {
+    const provider = new ScriptedProvider();
+    const runTarget = {
+      kind: "inventory_increment" as const,
+      task: "mine_cobblestone" as const,
+      item: "cobblestone",
+      startingCount: 2,
+      requiredCount: 3,
+      increment: 1,
+    };
+
+    await expect(provider.nextToolCall({
+      task: "mine_cobblestone",
+      observation: {
+        ...observation,
+        inventory: [
+          { name: "cobblestone", count: 2 },
+          { name: "wooden_pickaxe", count: 1 },
+        ],
+      },
+      iteration: 0,
+      runTarget,
+    })).resolves.toEqual({ tool: "mine_block", args: { block: "stone", count: 1, maxDistance: 128 } });
+
+    await expect(provider.nextToolCall({
+      task: "mine_cobblestone",
+      observation: {
+        ...observation,
+        inventory: [
+          { name: "cobblestone", count: 3 },
+          { name: "wooden_pickaxe", count: 1 },
+        ],
+      },
+      iteration: 1,
+      runTarget,
+    })).resolves.toEqual({ tool: "stop", args: { reason: "cobblestone mined" } });
+  });
+
+  it("includes run increment targets in model prompts", () => {
+    const messages = buildOpenAIMessages({
+      task: "mine_cobblestone",
+      observation: {
+        ...observation,
+        inventory: [
+          { name: "cobblestone", count: 2 },
+          { name: "wooden_pickaxe", count: 1 },
+        ],
+      },
+      iteration: 0,
+      runTarget: {
+        kind: "inventory_increment",
+        task: "mine_cobblestone",
+        item: "cobblestone",
+        startingCount: 2,
+        requiredCount: 3,
+        increment: 1,
+      },
+    });
+
+    expect(messages[1].content).toContain("increase cobblestone from 2 to at least 3");
+    expect(messages[1].content).toContain("Do not stop just because the task was already satisfied before this run.");
+  });
+
   it("loads model-policy config and escalation order", () => {
     const config = loadConfig([
       "--provider", "openai-compatible",

@@ -5,12 +5,14 @@ import { errorMessage, failedResult, okResult } from "../errors.js";
 import { firstMatchingInventoryItem, itemCandidates } from "../inventory.js";
 import { buildObservation } from "../observation.js";
 import { recipeLookup } from "../recipes.js";
-import type { SymbolicObservation, ToolResult } from "../types.js";
+import type { ToolResult } from "../types.js";
 import type { ToolCall } from "./schema.js";
 
 const { goals } = pathfinderPkg;
 const PATH_ATTEMPT_TIMEOUT_MS = 12_000;
 type PathfinderGoal = InstanceType<typeof goals.Goal>;
+type MineableBlock = NonNullable<ReturnType<Bot["blockAt"]>>;
+type InventoryItem = ReturnType<Bot["inventory"]["items"]>[number];
 
 type RunnerState = {
   stopRequested: boolean;
@@ -25,6 +27,27 @@ const FOOD_NAMES = [
   "cooked_chicken",
   "baked_potato",
   "carrot",
+];
+
+const HARVEST_TOOL_ORDER = [
+  "netherite_pickaxe",
+  "diamond_pickaxe",
+  "iron_pickaxe",
+  "stone_pickaxe",
+  "wooden_pickaxe",
+  "golden_pickaxe",
+  "netherite_axe",
+  "diamond_axe",
+  "iron_axe",
+  "stone_axe",
+  "wooden_axe",
+  "golden_axe",
+  "netherite_shovel",
+  "diamond_shovel",
+  "iron_shovel",
+  "stone_shovel",
+  "wooden_shovel",
+  "golden_shovel",
 ];
 
 export async function executeTool(
@@ -89,6 +112,7 @@ async function mineBlock(
   maxDistance: number,
 ): Promise<ToolResult> {
   const mined: string[] = [];
+  const toolsUsed = new Set<string>();
   const dropQuery = expectedDropQuery(blockQuery);
   const initialDropCount = countInventoryFromBot(bot, dropQuery);
   let attempts = 0;
@@ -102,7 +126,13 @@ async function mineBlock(
       await collectNearbyItems(bot, 12);
       const collected = countInventoryFromBot(bot, dropQuery) - initialDropCount;
       if (collected >= count) {
-        return okResult(`Mined ${mined.length} block(s).`, { mined, collected, drop: dropQuery, attempts });
+        return okResult(`Mined ${mined.length} block(s).`, {
+          mined,
+          collected,
+          drop: dropQuery,
+          attempts,
+          toolsUsed: [...toolsUsed],
+        });
       }
       if (mined.length > 0) {
         return failedResult("insufficient_drops", `Only collected ${collected}/${count} ${dropQuery}.`, true, {
@@ -111,10 +141,20 @@ async function mineBlock(
           requested: count,
           drop: dropQuery,
           attempts,
+          toolsUsed: [...toolsUsed],
         });
       }
       return failedResult("block_not_found", `No ${blockQuery} found within ${maxDistance} blocks.`);
     }
+
+    const harvestTool = await ensureHarvestTool(bot, block);
+    if (!harvestTool.ok) {
+      return failedResult("missing_harvest_tool", `No suitable tool to harvest ${block.name}.`, true, {
+        block: block.name,
+        availableTools: harvestTool.availableTools,
+      });
+    }
+    if (harvestTool.item) toolsUsed.add(harvestTool.item);
 
     if (!bot.canDigBlock(block)) {
       lastError = new Error(`Cannot dig ${block.name}.`);
@@ -129,7 +169,13 @@ async function mineBlock(
       await collectNearbyItems(bot, 8);
       const collected = countInventoryFromBot(bot, dropQuery) - initialDropCount;
       if (collected >= count) {
-        return okResult(`Mined ${mined.length} block(s).`, { mined, collected, drop: dropQuery, attempts });
+        return okResult(`Mined ${mined.length} block(s).`, {
+          mined,
+          collected,
+          drop: dropQuery,
+          attempts,
+          toolsUsed: [...toolsUsed],
+        });
       }
       continue;
     }
@@ -148,10 +194,17 @@ async function mineBlock(
       requested: count,
       drop: dropQuery,
       attempts,
+      toolsUsed: [...toolsUsed],
       cause: errorMessage(lastError),
     });
   }
-  return okResult(`Mined ${mined.length} block(s).`, { mined, collected, drop: dropQuery, attempts });
+  return okResult(`Mined ${mined.length} block(s).`, {
+    mined,
+    collected,
+    drop: dropQuery,
+    attempts,
+    toolsUsed: [...toolsUsed],
+  });
 }
 
 async function craftItem(bot: Bot, itemQuery: string, count: number): Promise<ToolResult> {
@@ -390,6 +443,73 @@ async function collectNearbyItems(bot: Bot, maxDistance: number): Promise<void> 
 
 function expectedDropQuery(blockQuery: string): string {
   return itemCandidates(blockQuery).includes("stone") ? "cobblestone" : blockQuery;
+}
+
+async function ensureHarvestTool(
+  bot: Bot,
+  block: MineableBlock,
+): Promise<{ ok: true; item?: string } | { ok: false; availableTools: string[] }> {
+  if (blockCanHarvest(block, bot.heldItem?.type ?? null)) {
+    return { ok: true, item: bot.heldItem?.name };
+  }
+
+  const tool = bestHarvestTool(bot, block);
+  if (!tool) {
+    return { ok: false, availableTools: harvestToolNames(bot) };
+  }
+
+  await bot.equip(tool, "hand");
+  if (!blockCanHarvest(block, tool.type)) {
+    return { ok: false, availableTools: harvestToolNames(bot) };
+  }
+
+  return { ok: true, item: tool.name };
+}
+
+function bestHarvestTool(bot: Bot, block: MineableBlock): InventoryItem | undefined {
+  return bot.inventory.items()
+    .filter((item) => blockCanHarvest(block, item.type))
+    .sort((a, b) => (
+      blockDigTime(block, a) - blockDigTime(block, b)
+      || harvestToolPreference(a.name) - harvestToolPreference(b.name)
+    ))[0];
+}
+
+function blockCanHarvest(block: MineableBlock, itemType: number | null): boolean {
+  const candidate = block as MineableBlock & {
+    canHarvest?: (heldItemType: number | null) => boolean;
+    harvestTools?: Record<string, boolean>;
+  };
+  if (typeof candidate.canHarvest === "function") return candidate.canHarvest(itemType);
+  if (!candidate.harvestTools) return true;
+  return itemType !== null && Boolean(candidate.harvestTools[String(itemType)]);
+}
+
+function blockDigTime(block: MineableBlock, item: InventoryItem): number {
+  const candidate = block as MineableBlock & {
+    digTime?: (
+      heldItemType: number | null,
+      creative: boolean,
+      inWater: boolean,
+      notOnGround: boolean,
+      enchantments?: unknown[],
+      effects?: Record<string, unknown>,
+    ) => number;
+  };
+  if (typeof candidate.digTime !== "function") return Number.POSITIVE_INFINITY;
+  const time = candidate.digTime(item.type, false, false, false, (item as { enchants?: unknown[] }).enchants ?? [], {});
+  return Number.isFinite(time) ? time : Number.POSITIVE_INFINITY;
+}
+
+function harvestToolPreference(name: string): number {
+  const index = HARVEST_TOOL_ORDER.indexOf(name);
+  return index >= 0 ? index : HARVEST_TOOL_ORDER.length;
+}
+
+function harvestToolNames(bot: Bot): string[] {
+  return bot.inventory.items()
+    .filter((item) => HARVEST_TOOL_ORDER.includes(item.name))
+    .map((item) => item.name);
 }
 
 async function goToCraftingTable(bot: Bot) {

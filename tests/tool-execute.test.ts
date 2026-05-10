@@ -2,6 +2,95 @@ import { describe, expect, it, vi } from "vitest";
 import { executeTool } from "../src/tools/execute.js";
 
 describe("executeTool mine_block", () => {
+  it("equips a valid pickaxe before mining stone drops", async () => {
+    const woodenPickaxe = { name: "wooden_pickaxe", type: 270, count: 1, enchants: [] };
+    const cobblestone = { name: "cobblestone", type: 4, count: 1, enchants: [] };
+    const block = {
+      name: "stone",
+      position: { x: 0, y: 64, z: 0 },
+      canHarvest: vi.fn((heldItemType: number | null) => heldItemType === woodenPickaxe.type),
+      digTime: vi.fn((heldItemType: number | null) => (heldItemType === woodenPickaxe.type ? 10 : Infinity)),
+    };
+    let inventoryItems = [woodenPickaxe];
+    const calls: string[] = [];
+    const bot = {
+      heldItem: undefined as typeof woodenPickaxe | undefined,
+      registry: {
+        blocksByName: { stone: { id: 1 } },
+      },
+      findBlocks: vi.fn(() => [block.position]),
+      blockAt: vi.fn(() => block),
+      entity: { position: { distanceTo: () => 1 } },
+      pathfinder: { goto: vi.fn(async () => undefined) },
+      canDigBlock: vi.fn(() => true),
+      equip: vi.fn(async (item: typeof woodenPickaxe) => {
+        calls.push("equip");
+        bot.heldItem = item;
+      }),
+      dig: vi.fn(async () => {
+        calls.push("dig");
+        expect(bot.heldItem?.name).toBe("wooden_pickaxe");
+        inventoryItems = [woodenPickaxe, cobblestone];
+      }),
+      waitForTicks: vi.fn(async () => undefined),
+      entities: {},
+      inventory: { items: vi.fn(() => inventoryItems) },
+    };
+    const state = { stopRequested: false };
+
+    const result = await executeTool(
+      bot as never,
+      { tool: "mine_block", args: { block: "stone", count: 1, maxDistance: 32 } },
+      state,
+    );
+
+    expect(result.ok).toBe(true);
+    expect(bot.equip).toHaveBeenCalledWith(woodenPickaxe, "hand");
+    expect(calls).toEqual(["equip", "dig"]);
+    expect(result.data).toMatchObject({
+      collected: 1,
+      drop: "cobblestone",
+      toolsUsed: ["wooden_pickaxe"],
+    });
+  });
+
+  it("does not mine harvest-tool blocks when no suitable tool is available", async () => {
+    const block = {
+      name: "stone",
+      position: { x: 0, y: 64, z: 0 },
+      canHarvest: vi.fn(() => false),
+    };
+    const bot = {
+      heldItem: undefined,
+      registry: {
+        blocksByName: { stone: { id: 1 } },
+      },
+      findBlocks: vi.fn(() => [block.position]),
+      blockAt: vi.fn(() => block),
+      entity: { position: { distanceTo: () => 1 } },
+      pathfinder: { goto: vi.fn(async () => undefined) },
+      canDigBlock: vi.fn(() => true),
+      dig: vi.fn(async () => undefined),
+      waitForTicks: vi.fn(async () => undefined),
+      entities: {},
+      inventory: { items: vi.fn(() => []) },
+    };
+    const state = { stopRequested: false };
+
+    const result = await executeTool(
+      bot as never,
+      { tool: "mine_block", args: { block: "stone", count: 1, maxDistance: 32 } },
+      state,
+    );
+
+    expect(result.ok).toBe(false);
+    expect(result.error).toMatchObject({
+      code: "missing_harvest_tool",
+      retryable: true,
+    });
+    expect(bot.dig).not.toHaveBeenCalled();
+  });
+
   it("fails retryably when mined blocks do not produce requested drops", async () => {
     const block = {
       name: "oak_log",
