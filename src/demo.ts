@@ -6,13 +6,14 @@ import type { AddressInfo } from "node:net";
 import type { Bot } from "mineflayer";
 import { loadConfig, type AppConfig } from "./config.js";
 import { failedResult } from "./errors.js";
+import { resetBotState, type ResetResult } from "./demoReset.js";
 import { createMinecraftBot } from "./minecraft.js";
 import { buildObservation } from "./observation.js";
 import { runTask } from "./runner.js";
 import { smokeSteps, type SmokeProfile } from "./smokePlan.js";
 import { scoreTask, TASKS } from "./tasks.js";
 import { withTimeout } from "./timeout.js";
-import type { SymbolicObservation, TaskName, TaskScore, ToolResult } from "./types.js";
+import type { RunControlState, SymbolicObservation, TaskName, TaskScore, ToolResult } from "./types.js";
 import { executeTool } from "./tools/execute.js";
 import { validateToolCall, type ToolCall } from "./tools/schema.js";
 
@@ -27,11 +28,14 @@ type SmokeEvent = {
   toolResult: ToolResult;
   observationBefore: unknown;
   observationAfter: unknown;
+  scoreBefore?: TaskScore;
+  scoreAfter?: TaskScore;
+  elapsedMs: number;
 };
 
 type DashboardActivity = {
-  status: "idle" | "running" | "complete" | "failed";
-  kind?: "llm_task" | "smoke_plan" | "tool_call";
+  status: "idle" | "resetting" | "running" | "stopping" | "stopped" | "complete" | "failed";
+  kind?: "llm_task" | "smoke_plan" | "tool_call" | "reset";
   label?: string;
   message?: string;
   logPath?: string;
@@ -44,10 +48,23 @@ type DashboardControlEvent = {
   source: "dashboard";
   name: string;
   score: TaskScore;
+  scoreBefore: TaskScore;
+  scoreAfter: TaskScore;
   toolCall: ToolCall;
   toolResult: ToolResult;
   observationBefore: SymbolicObservation;
   observationAfter: SymbolicObservation;
+  inventoryBefore: SymbolicObservation["inventory"];
+  inventoryAfter: SymbolicObservation["inventory"];
+  elapsedMs: number;
+};
+
+type DashboardResetEvent = {
+  iteration: number;
+  source: "dashboard";
+  name: string;
+  toolResult: ResetResult;
+  observationAfter?: SymbolicObservation;
   elapsedMs: number;
 };
 
@@ -62,8 +79,9 @@ type DashboardContext = {
   startedAt: Date;
   selectedTask: TaskName;
   stepDelayMs: number;
-  controlState: { stopRequested: boolean; lastActionResult?: ToolResult };
+  controlState: RunControlState;
   controlEvents: DashboardControlEvent[];
+  resetEvents: DashboardResetEvent[];
   activity: DashboardActivity;
   activeOperation?: Promise<void>;
   lastActivityAt: number;
@@ -101,6 +119,7 @@ const context: DashboardContext = {
   stepDelayMs,
   controlState: { stopRequested: false },
   controlEvents: [],
+  resetEvents: [],
   activity: { status: "idle", message: "Ready." },
   lastActivityAt: Date.now(),
 };
@@ -145,9 +164,17 @@ function beginLlmTask(context: DashboardContext, task: TaskName, maxIterations: 
     label: `LLM task: ${task}`,
     logPath,
   }, async () => {
-    const result = await runTask(context.bot, runConfig, { logPath });
+    const result = await runTask(context.bot, runConfig, { logPath, controlState: context.controlState });
     console.log(`Demo log: ${result.logPath}`);
     console.log(result.score.complete ? "Demo complete." : "Demo failed at: llm task");
+    if (result.status === "stopped") {
+      return {
+        ok: false,
+        status: "stopped",
+        message: context.controlState.stopReason ?? "Task stopped.",
+        logPath: result.logPath,
+      };
+    }
     return {
       ok: result.score.complete,
       message: result.score.complete ? "Task complete." : "Task incomplete.",
@@ -166,12 +193,22 @@ function beginSmokePlan(context: DashboardContext, profile: SmokeProfile): boole
     label: `Smoke plan: ${profile}`,
     logPath,
   }, async () => {
-    const result = await runSmokeDemo(context.bot, context.config, profile, context.stepDelayMs, logPath);
+    const result = await runSmokeDemo(
+      context.bot,
+      context.config,
+      profile,
+      context.stepDelayMs,
+      logPath,
+      context.controlState,
+    );
     console.log(`Demo log: ${result.logPath}`);
     console.log(result.ok ? "Demo complete." : `Demo failed at: ${result.failedStep ?? "smoke plan"}`);
     return {
       ok: result.ok,
-      message: result.ok ? "Smoke plan complete." : `Smoke plan failed at ${result.failedStep ?? "unknown step"}.`,
+      status: result.stopped ? "stopped" : undefined,
+      message: result.stopped
+        ? "Smoke plan stopped."
+        : (result.ok ? "Smoke plan complete." : `Smoke plan failed at ${result.failedStep ?? "unknown step"}.`),
       logPath: result.logPath,
     };
   });
@@ -187,6 +224,7 @@ function beginToolCall(context: DashboardContext, toolCall: ToolCall, name?: str
   }, async () => {
     const startedMs = Date.now();
     const observationBefore = buildObservation(context.bot, context.controlState.lastActionResult);
+    const scoreBefore = scoreTask(context.selectedTask, observationBefore);
     const toolResult = await withTimeout(
       executeTool(context.bot, toolCall, context.controlState),
       context.config.toolExecutionTimeoutMs,
@@ -201,16 +239,20 @@ function beginToolCall(context: DashboardContext, toolCall: ToolCall, name?: str
     );
     context.controlState.lastActionResult = toolResult;
     const observationAfter = buildObservation(context.bot, context.controlState.lastActionResult);
-    const score = scoreTask(context.selectedTask, observationAfter);
+    const scoreAfter = scoreTask(context.selectedTask, observationAfter);
     const event: DashboardControlEvent = {
       iteration: context.controlEvents.length,
       source: "dashboard",
       name: label,
-      score,
+      score: scoreAfter,
+      scoreBefore,
+      scoreAfter,
       toolCall,
       toolResult,
       observationBefore,
       observationAfter,
+      inventoryBefore: observationBefore.inventory,
+      inventoryAfter: observationAfter.inventory,
       elapsedMs: Date.now() - startedMs,
     };
     context.controlEvents.push(event);
@@ -218,28 +260,107 @@ function beginToolCall(context: DashboardContext, toolCall: ToolCall, name?: str
     await writeControlLog(context);
     return {
       ok: toolResult.ok,
+      status: toolResult.error?.code === "stopped" ? "stopped" : undefined,
       message: toolResult.message,
       logPath: context.controlLogPath,
     };
   });
 }
 
+function beginReset(context: DashboardContext): boolean {
+  if (context.activeOperation) return false;
+  return beginOperation(context, {
+    kind: "reset",
+    label: "Reset State",
+    logPath: context.controlLogPath,
+  }, async () => runReset(context, "Manual reset"));
+}
+
+function requestStop(context: DashboardContext, reason = "Stop requested from dashboard."): boolean {
+  context.controlState.stopRequested = true;
+  context.controlState.stopReason = reason;
+  context.bot.pathfinder?.stop();
+  context.lastActivityAt = Date.now();
+  if (!context.activeOperation) {
+    context.activity = {
+      status: "stopped",
+      kind: context.activity.kind,
+      label: context.activity.label ?? "Stop Agent",
+      message: reason,
+      logPath: context.activity.logPath,
+      startedAt: context.activity.startedAt,
+      endedAt: new Date().toISOString(),
+    };
+    return true;
+  }
+  context.activity = {
+    ...context.activity,
+    status: "stopping",
+    message: reason,
+  };
+  return true;
+}
+
+async function runReset(
+  context: DashboardContext,
+  label: string,
+): Promise<{ ok: boolean; status?: DashboardActivity["status"]; message: string; logPath: string }> {
+  const priorActivity = context.activity;
+  context.activity = {
+    ...priorActivity,
+    status: "resetting",
+    label,
+    message: "Resetting bot and configured world state.",
+    logPath: context.controlLogPath,
+  };
+
+  const startedMs = Date.now();
+  const result = await resetBotState(context.bot, context.config, context.controlState);
+  const observationAfter = safeObservation(context.bot, context.controlState.lastActionResult);
+  context.resetEvents.push({
+    iteration: context.resetEvents.length,
+    source: "dashboard",
+    name: label,
+    toolResult: result,
+    observationAfter,
+    elapsedMs: Date.now() - startedMs,
+  });
+  context.resetEvents = context.resetEvents.slice(-50);
+  await writeControlLog(context);
+  context.lastActivityAt = Date.now();
+
+  return {
+    ok: result.ok,
+    status: result.ok ? "complete" : "failed",
+    message: result.message,
+    logPath: context.controlLogPath,
+  };
+}
+
 function beginOperation(
   context: DashboardContext,
   activity: Omit<DashboardActivity, "status" | "startedAt">,
-  work: () => Promise<{ ok: boolean; message: string; logPath?: string }>,
+  work: () => Promise<{
+    ok: boolean;
+    status?: DashboardActivity["status"];
+    message: string;
+    logPath?: string;
+  }>,
 ): boolean {
   if (context.activeOperation) return false;
 
   const startedAt = new Date().toISOString();
   context.lastActivityAt = Date.now();
+  context.controlState.stopRequested = false;
+  context.controlState.stopReason = undefined;
   context.activity = { ...activity, status: "running", startedAt };
   context.activeOperation = (async () => {
     try {
       const result = await work();
+      const status = result.status ?? (result.ok ? "complete" : "failed");
       context.activity = {
         ...activity,
-        status: result.ok ? "complete" : "failed",
+        status,
         startedAt,
         endedAt: new Date().toISOString(),
         message: result.message,
@@ -255,7 +376,7 @@ function beginOperation(
         logPath: activity.logPath,
       };
     } finally {
-      if (activity.kind === "tool_call") {
+      if (activity.kind === "tool_call" || activity.kind === "reset") {
         await writeControlLog(context).catch(() => undefined);
       }
       context.activeOperation = undefined;
@@ -275,18 +396,36 @@ async function runSmokeDemo(
   profile: SmokeProfile,
   delayMs: number,
   logPath: string,
-): Promise<{ ok: boolean; failedStep?: string; logPath: string }> {
-  const state: { stopRequested: boolean; lastActionResult?: ToolResult } = { stopRequested: false };
+  state: RunControlState,
+): Promise<{ ok: boolean; failedStep?: string; logPath: string; stopped?: boolean }> {
   const events: SmokeEvent[] = [];
   let failedStep: string | undefined;
+  let stopped = false;
 
   for (const [index, step] of smokeSteps(profile).entries()) {
+    if (state.stopRequested) {
+      stopped = true;
+      failedStep = step.name;
+      state.lastActionResult = failedResult("stopped", state.stopReason ?? "Smoke plan stopped.", false, {
+        stopped: true,
+      });
+      break;
+    }
     await sleep(delayMs);
     console.log(`[${index + 1}] ${step.name}: ${step.call.tool}`);
+    const startedMs = Date.now();
     const observationBefore = buildObservation(bot, state.lastActionResult);
+    const scoreBefore = scoreTask(config.task, observationBefore);
     const result = await executeTool(bot, step.call, state);
     state.lastActionResult = result;
     const observationAfter = buildObservation(bot, state.lastActionResult);
+    const scoreAfter = scoreTask(config.task, observationAfter);
+    const plannedStop = step.call.tool === "stop";
+    if (plannedStop && result.ok) {
+      state.stopRequested = false;
+      state.stopReason = undefined;
+    }
+    stopped = !plannedStop && (result.error?.code === "stopped" || state.stopRequested);
     events.push({
       step: index,
       name: step.name,
@@ -294,18 +433,21 @@ async function runSmokeDemo(
       toolResult: result,
       observationBefore,
       observationAfter,
+      scoreBefore,
+      scoreAfter,
+      elapsedMs: Date.now() - startedMs,
     });
     await writeSmokeLog(config, profile, logPath, events, "running");
     console.log(`    ${result.ok ? "ok" : "error"}: ${result.message}`);
 
-    if (!result.ok) {
+    if (!result.ok || stopped) {
       failedStep = step.name;
       break;
     }
   }
 
-  await writeSmokeLog(config, profile, logPath, events, failedStep ? "failed" : "complete", failedStep);
-  return { ok: !failedStep, failedStep, logPath };
+  await writeSmokeLog(config, profile, logPath, events, stopped ? "stopped" : (failedStep ? "failed" : "complete"), failedStep);
+  return { ok: !failedStep, failedStep, logPath, stopped };
 }
 
 async function writeSmokeLog(
@@ -313,7 +455,7 @@ async function writeSmokeLog(
   profile: SmokeProfile,
   logPath: string,
   events: SmokeEvent[],
-  status: "running" | "complete" | "failed",
+  status: "running" | "complete" | "failed" | "stopped",
   failedStep?: string,
 ): Promise<void> {
   await mkdir(config.logDir, { recursive: true });
@@ -335,6 +477,7 @@ async function writeControlLog(context: DashboardContext): Promise<void> {
     endedAt: new Date().toISOString(),
     status: context.activity.status,
     selectedTask: context.selectedTask,
+    resetEvents: context.resetEvents,
     events: context.controlEvents,
     finalObservation,
     finalScore: scoreTask(context.selectedTask, finalObservation),
@@ -400,6 +543,21 @@ async function handleControlRequest(
     return true;
   }
 
+  if (pathname === "/control/reset") {
+    await readRequestJson(request);
+    const accepted = beginReset(context);
+    sendJson(response, { accepted, activity: context.activity }, accepted ? 202 : 409);
+    return true;
+  }
+
+  if (pathname === "/control/stop") {
+    const body = objectField(await readRequestJson(request));
+    const reason = typeof body?.reason === "string" ? body.reason : undefined;
+    const accepted = requestStop(context, reason);
+    sendJson(response, { accepted, activity: context.activity }, 202);
+    return true;
+  }
+
   return false;
 }
 
@@ -413,6 +571,15 @@ async function dashboardState(context: DashboardContext) {
     name: step.name,
     toolCall: step.call,
   }));
+  const resetTimeline = context.resetEvents.map((event) => ({
+    iteration: `reset-${event.iteration}`,
+    name: event.name,
+    toolCall: { tool: "reset_state", args: { configured: true } },
+    toolResult: event.toolResult,
+    observationAfter: event.observationAfter,
+    inventoryAfter: event.observationAfter?.inventory,
+    elapsedMs: event.elapsedMs,
+  }));
 
   return {
     mode: context.mode,
@@ -423,6 +590,12 @@ async function dashboardState(context: DashboardContext) {
     logPath: context.logPath,
     controlLogPath: context.controlLogPath,
     activity: context.activity,
+    reset: {
+      configuredCommands: context.config.resetCommands.length,
+      resetSpawn: context.config.resetSpawn,
+      resetWaitTicks: context.config.resetWaitTicks,
+      lastResult: context.resetEvents.at(-1)?.toolResult,
+    },
     bot: {
       username: context.config.username,
       host: context.config.host,
@@ -437,9 +610,10 @@ async function dashboardState(context: DashboardContext) {
     runStatus: context.activity.status === "idle" ? objectField(log)?.status : context.activity.status,
     finalScore: objectField(log)?.finalScore,
     llmTrace: logEvents.map(llmTraceEvent).filter(Boolean),
-    toolCalls: [...logEvents, ...context.controlEvents].map(toolCallEvent).filter(Boolean),
+    toolCalls: [...logEvents, ...context.controlEvents, ...resetTimeline].map(toolCallEvent).filter(Boolean),
     controls: {
       busy: Boolean(context.activeOperation),
+      stopping: context.activity.status === "stopping",
       tasks: TASKS,
       smokeProfiles: ["early", "full"],
       actions,
@@ -464,6 +638,9 @@ function llmTraceEvent(event: unknown) {
     normalization: event.normalization,
     promptReference: event.promptReference,
     providerOutput: event.providerOutput,
+    parsedToolCall: event.toolCall,
+    toolResult: event.toolResult,
+    toolElapsedMs: event.toolElapsedMs,
     attempts,
   };
 }
@@ -477,8 +654,13 @@ function toolCallEvent(event: unknown) {
     iteration: event.iteration ?? event.step,
     name: event.name,
     score: event.score,
+    scoreBefore: event.scoreBefore,
+    scoreAfter: event.scoreAfter,
     toolCall,
     toolResult,
+    elapsedMs: event.elapsedMs ?? event.toolElapsedMs,
+    inventoryBefore: event.inventoryBefore ?? objectField(event.observationBefore)?.inventory,
+    inventoryAfter: event.inventoryAfter ?? objectField(event.observationAfter)?.inventory,
   };
 }
 
@@ -492,67 +674,87 @@ function dashboardHtml(viewerPort: number): string {
   <style>
     :root {
       color-scheme: dark;
-      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      background: #101214;
-      color: #edf0f2;
+      font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, sans-serif;
+      background: #000;
+      color: #fafafa;
+      --bg: #000;
+      --panel: #050505;
+      --panel-raised: #0a0a0a;
+      --border: #262626;
+      --border-strong: #3f3f46;
+      --text: #fafafa;
+      --muted: #a1a1aa;
+      --faint: #71717a;
+      --field: #0a0a0a;
+      --field-hover: #111;
+      --accent: #fff;
+      --danger: #ef4444;
+      --success: #22c55e;
     }
     * { box-sizing: border-box; }
-    body { margin: 0; min-height: 100vh; background: #101214; }
+    body { margin: 0; min-height: 100vh; background: var(--bg); }
     main {
       display: grid;
       grid-template-columns: minmax(420px, 1.15fr) minmax(420px, 0.85fr);
       min-height: 100vh;
     }
-    iframe { width: 100%; height: 100vh; border: 0; background: #050607; }
+    iframe { width: 100%; height: 100vh; border: 0; background: #000; }
     .side {
       display: grid;
-      grid-template-rows: auto auto minmax(180px, 0.75fr) minmax(220px, 1fr) minmax(220px, 1fr);
-      min-height: 100vh;
-      border-left: 1px solid #2a2f35;
-      background: #16191d;
+      grid-template-rows: auto 240px minmax(105px, 0.5fr) minmax(125px, 0.75fr) minmax(125px, 0.75fr);
+      height: 100vh;
+      min-height: 0;
+      border-left: 1px solid var(--border);
+      background: var(--bg);
+      overflow: hidden;
     }
     header {
       display: grid;
-      gap: 8px;
-      padding: 14px 16px;
-      border-bottom: 1px solid #2a2f35;
-      background: #1d2228;
+      gap: 10px;
+      padding: 16px 18px 14px;
+      border-bottom: 1px solid var(--border);
+      background: var(--panel);
     }
-    h1 { margin: 0; font-size: 18px; font-weight: 650; letter-spacing: 0; }
+    h1 { margin: 0; font-size: 17px; font-weight: 650; letter-spacing: 0; color: var(--text); }
     .meta {
       display: flex;
       flex-wrap: wrap;
-      gap: 8px;
-      color: #aeb7c1;
-      font-size: 12px;
+      gap: 6px;
+      color: var(--muted);
+      font-size: 11px;
     }
     .pill {
-      padding: 3px 7px;
-      border: 1px solid #38424c;
-      border-radius: 6px;
-      background: #15191e;
+      max-width: 100%;
+      padding: 3px 8px;
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      background: #000;
+      color: #d4d4d8;
       white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
     }
     section {
       min-height: 0;
       overflow: auto;
-      padding: 12px 16px;
-      border-bottom: 1px solid #2a2f35;
+      padding: 14px 18px;
+      border-bottom: 1px solid var(--border);
+      background: var(--bg);
     }
     h2 {
-      margin: 0 0 10px;
-      font-size: 13px;
-      font-weight: 650;
-      color: #d9dee4;
+      margin: 0 0 12px;
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--text);
       letter-spacing: 0;
     }
     pre {
       margin: 0;
-      padding: 10px;
-      border: 1px solid #303842;
-      border-radius: 6px;
-      background: #0f1215;
-      color: #dce7ef;
+      padding: 12px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--panel);
+      color: #e4e4e7;
       font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
       overflow: auto;
       white-space: pre-wrap;
@@ -560,9 +762,9 @@ function dashboardHtml(viewerPort: number): string {
     }
     .list { display: grid; gap: 10px; }
     .row {
-      border: 1px solid #303842;
-      border-radius: 6px;
-      background: #11151a;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--panel);
       overflow: hidden;
     }
     .row-head {
@@ -571,24 +773,42 @@ function dashboardHtml(viewerPort: number): string {
       gap: 8px;
       align-items: center;
       justify-content: space-between;
-      padding: 8px 10px;
-      border-bottom: 1px solid #26303a;
-      color: #d8dee5;
+      padding: 9px 11px;
+      border-bottom: 1px solid var(--border);
+      color: #e4e4e7;
       font-size: 12px;
     }
-    .ok { color: #8fe0a4; }
-    .bad { color: #ffb08f; }
+    .ok { color: var(--success); }
+    .bad { color: var(--danger); }
     details { padding: 8px 10px; }
+    details.manual {
+      padding: 0;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--panel);
+    }
     summary {
       cursor: pointer;
-      color: #aeb7c1;
+      color: var(--muted);
       font-size: 12px;
       margin-bottom: 8px;
     }
-    .empty { color: #808a95; font-size: 12px; }
+    .manual summary {
+      margin: 0;
+      padding: 8px 10px;
+      color: #e4e4e7;
+      font-weight: 600;
+    }
+    .manual-grid {
+      display: grid;
+      gap: 8px;
+      padding: 0 10px 10px;
+    }
+    .empty { color: var(--faint); font-size: 12px; }
     .controls {
       display: grid;
-      gap: 10px;
+      gap: 12px;
+      overflow: auto;
     }
     .control-grid {
       display: grid;
@@ -599,21 +819,26 @@ function dashboardHtml(viewerPort: number): string {
     label {
       display: grid;
       gap: 5px;
-      color: #aeb7c1;
+      color: var(--muted);
       font-size: 12px;
       min-width: 0;
     }
     select, input, textarea, button {
       width: 100%;
-      border: 1px solid #38424c;
+      border: 1px solid var(--border);
       border-radius: 6px;
-      background: #101419;
-      color: #eef2f5;
+      background: var(--field);
+      color: var(--text);
       font: inherit;
     }
     select, input, button {
-      min-height: 32px;
-      padding: 5px 8px;
+      min-height: 34px;
+      padding: 6px 10px;
+    }
+    select:hover, input:hover, textarea:hover { background: var(--field-hover); border-color: var(--border-strong); }
+    select:focus, input:focus, textarea:focus, button:focus {
+      outline: 2px solid #fff;
+      outline-offset: 1px;
     }
     textarea {
       min-height: 76px;
@@ -623,25 +848,57 @@ function dashboardHtml(viewerPort: number): string {
     }
     button {
       cursor: pointer;
-      background: #24313b;
-      font-weight: 650;
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #000;
+      font-weight: 600;
       white-space: nowrap;
+      transition: background 120ms ease, border-color 120ms ease, color 120ms ease, opacity 120ms ease;
     }
+    button:hover:not(:disabled) { background: #e4e4e7; border-color: #e4e4e7; }
+    button.secondary {
+      background: #000;
+      border-color: var(--border-strong);
+      color: var(--text);
+    }
+    button.secondary:hover:not(:disabled) { background: #111; border-color: #a1a1aa; }
+    button.danger {
+      background: #000;
+      border-color: #7f1d1d;
+      color: #fca5a5;
+    }
+    button.danger:hover:not(:disabled) { background: #1f0b0b; border-color: var(--danger); }
     button:disabled {
       cursor: not-allowed;
-      opacity: 0.55;
+      opacity: 0.5;
     }
     .wide { grid-column: 1 / -1; }
+    .button-row {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+      align-items: center;
+    }
     .status-line {
-      color: #aeb7c1;
+      color: var(--muted);
       font-size: 12px;
       min-height: 18px;
     }
     @media (max-width: 960px) {
       main { grid-template-columns: 1fr; }
       iframe { height: 48vh; }
-      .side { min-height: 52vh; border-left: 0; border-top: 1px solid #2a2f35; }
+      .side {
+        height: auto;
+        min-height: 52vh;
+        overflow: visible;
+        grid-template-rows: auto;
+        border-left: 0;
+        border-top: 1px solid var(--border);
+      }
+      section { max-height: 42vh; }
+      section.controls { max-height: none; }
       .control-grid { grid-template-columns: 1fr; }
+      .button-row { grid-template-columns: 1fr; }
     }
   </style>
 </head>
@@ -656,6 +913,10 @@ function dashboardHtml(viewerPort: number): string {
       <section class="controls">
         <h2>Run Controls</h2>
         <div class="control-grid">
+          <div class="button-row wide">
+            <button id="stopAgent" class="danger" type="button">Stop Agent</button>
+            <button id="resetState" class="secondary" type="button">Reset State</button>
+          </div>
           <label>Task
             <select id="taskSelect"></select>
           </label>
@@ -671,15 +932,18 @@ function dashboardHtml(viewerPort: number): string {
           </label>
           <span></span>
           <button id="runSmoke" type="button">Run Smoke Plan</button>
-          <label class="wide">Action
-            <select id="actionSelect"></select>
-          </label>
-          <label class="wide">Tool JSON
-            <textarea id="toolJson" spellcheck="false"></textarea>
-          </label>
-          <span></span>
-          <span></span>
-          <button id="runTool" type="button">Run Tool Call</button>
+          <details class="manual wide">
+            <summary>Manual Tool Call</summary>
+            <div class="manual-grid">
+              <label>Action
+                <select id="actionSelect"></select>
+              </label>
+              <label>Tool JSON
+                <textarea id="toolJson" spellcheck="false"></textarea>
+              </label>
+              <button id="runTool" type="button">Run Tool Call</button>
+            </div>
+          </details>
         </div>
         <div id="controlStatus" class="status-line"></div>
       </section>
@@ -743,18 +1007,22 @@ function dashboardHtml(viewerPort: number): string {
         document.getElementById("runTask").addEventListener("click", runTaskFromControls);
         document.getElementById("runSmoke").addEventListener("click", runSmokeFromControls);
         document.getElementById("runTool").addEventListener("click", runToolFromControls);
+        document.getElementById("resetState").addEventListener("click", resetStateFromControls);
+        document.getElementById("stopAgent").addEventListener("click", stopAgentFromControls);
         controlsReady = true;
       }
 
       const busy = Boolean(state.controls?.busy);
-      for (const id of ["taskSelect", "maxIterations", "smokeSelect", "actionSelect", "toolJson", "runTask", "runSmoke", "runTool"]) {
+      for (const id of ["taskSelect", "maxIterations", "smokeSelect", "actionSelect", "toolJson", "runTask", "runSmoke", "runTool", "resetState"]) {
         document.getElementById(id).disabled = busy;
       }
+      document.getElementById("stopAgent").disabled = !busy || state.controls?.stopping;
       const activity = state.activity ?? {};
       document.getElementById("controlStatus").textContent = [
         activity.status ?? "idle",
         activity.label,
-        activity.message
+        activity.message,
+        state.reset?.lastResult?.ok === false ? state.reset.lastResult.message : undefined
       ].filter(Boolean).join(" | ");
     }
 
@@ -793,6 +1061,16 @@ function dashboardHtml(viewerPort: number): string {
         name: selected?.name,
         toolCall
       });
+      await refresh();
+    }
+
+    async function resetStateFromControls() {
+      await postControl("/control/reset", {});
+      await refresh();
+    }
+
+    async function stopAgentFromControls() {
+      await postControl("/control/stop", { reason: "Stop requested from dashboard." });
       await refresh();
     }
 
@@ -849,6 +1127,19 @@ function dashboardHtml(viewerPort: number): string {
           validationErrors: event.validationErrors,
           promptReference: event.promptReference,
           providerOutput: event.providerOutput,
+          parsedToolCall: event.parsedToolCall,
+          toolResult: event.toolResult,
+          timing: {
+            toolElapsedMs: event.toolElapsedMs,
+            attempts: (event.attempts ?? []).map((attempt) => ({
+              provider: attempt.provider,
+              model: attempt.model,
+              retry: attempt.retry,
+              fallback: attempt.fallback,
+              accepted: attempt.accepted,
+              elapsedMs: attempt.elapsedMs
+            }))
+          },
           attempts: event.attempts
         }));
         return row;
@@ -872,7 +1163,15 @@ function dashboardHtml(viewerPort: number): string {
           ok === undefined ? "pending" : (ok ? "ok" : "error")
         ], ok === undefined ? "" : (ok ? "ok" : "bad")));
         row.appendChild(detailsBlock("Call / result", {
-          score: event.score,
+          tool: event.toolCall?.tool,
+          args: event.toolCall?.args,
+          resultStatus: event.toolResult?.ok === undefined ? "pending" : (event.toolResult.ok ? "ok" : "error"),
+          errorMessage: event.toolResult?.error?.message,
+          elapsedMs: event.elapsedMs,
+          scoreBefore: event.scoreBefore,
+          scoreAfter: event.scoreAfter ?? event.score,
+          inventoryBefore: event.inventoryBefore,
+          inventoryAfter: event.inventoryAfter,
           toolCall: event.toolCall,
           toolResult: event.toolResult
         }));

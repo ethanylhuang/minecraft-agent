@@ -13,7 +13,7 @@ import {
 } from "./provider.js";
 import { scoreTask } from "./tasks.js";
 import { withTimeout } from "./timeout.js";
-import type { StructuredError, TaskScore, ToolResult } from "./types.js";
+import type { RunControlState, StructuredError, TaskScore, ToolResult } from "./types.js";
 import { executeTool } from "./tools/execute.js";
 import { validateToolCall, type ToolCall } from "./tools/schema.js";
 
@@ -71,6 +71,9 @@ type RunEvent = {
   observation?: unknown;
   observationText?: string;
   score?: TaskScore;
+  scoreAfter?: TaskScore;
+  inventoryBefore?: unknown;
+  inventoryAfter?: unknown;
   promptReference?: unknown;
   providerOutput?: unknown;
   normalization?: ToolCallNormalization;
@@ -83,22 +86,25 @@ type RunEvent = {
   llmAttempts?: LlmAttemptEvent[];
   toolCall?: unknown;
   toolResult?: ToolResult;
+  toolElapsedMs?: number;
 };
 
 export type RunTaskOptions = {
   logPath?: string;
+  controlState?: RunControlState;
 };
 
 export async function runTask(
   bot: Bot,
   config: AppConfig,
   options: RunTaskOptions = {},
-): Promise<{ logPath: string; score: TaskScore }> {
+): Promise<{ logPath: string; score: TaskScore; status: "complete" | "stopped" }> {
   const startedAt = new Date();
   const startedMs = Date.now();
-  const state: { stopRequested: boolean; lastActionResult?: ToolResult } = { stopRequested: false };
+  const state: RunControlState = options.controlState ?? { stopRequested: false };
   const events: RunEvent[] = [];
   let finalScore: TaskScore | undefined;
+  let finalStatus: "complete" | "stopped" = "complete";
   let lockedFallback: FallbackDecision | undefined;
   await mkdir(config.logDir, { recursive: true });
   const logPath = options.logPath
@@ -113,11 +119,23 @@ export async function runTask(
       observation,
       observationText: formatObservation(observation),
       score,
+      inventoryBefore: observation.inventory,
     };
     events.push(event);
     await writeRunLogSnapshot(logPath, config, startedAt, startedMs, events, state, bot, "running");
 
-    if (score.complete || state.stopRequested || bot.health <= 0) break;
+    if (score.complete || bot.health <= 0) break;
+    if (state.stopRequested) {
+      finalStatus = "stopped";
+      state.lastActionResult = failedResult(
+        "stopped",
+        state.stopReason ?? "Run stopped.",
+        false,
+        { stopped: true },
+      );
+      event.toolResult = state.lastActionResult;
+      break;
+    }
 
     const providerInput = { task: config.task, observation, iteration };
     const decisionTimeoutMs = llmDecisionBudgetMs(config, lockedFallback);
@@ -141,6 +159,18 @@ export async function runTask(
     event.fallbackDecision = decision.fallbackDecision;
     event.llmAttempts = decision.llmAttempts;
 
+    if (state.stopRequested) {
+      finalStatus = "stopped";
+      state.lastActionResult = failedResult(
+        "stopped",
+        state.stopReason ?? "Run stopped.",
+        false,
+        { stopped: true },
+      );
+      event.toolResult = state.lastActionResult;
+      break;
+    }
+
     if (!decision.toolCall) {
       state.lastActionResult = decision.toolResult ?? failedResult("model_policy_error", "No valid tool call produced.", true);
       event.toolResult = state.lastActionResult;
@@ -148,6 +178,7 @@ export async function runTask(
     }
 
     event.toolCall = decision.toolCall;
+    const toolStartedMs = Date.now();
     state.lastActionResult = await withTimeout(
       executeTool(bot, decision.toolCall, state),
       config.toolExecutionTimeoutMs,
@@ -160,13 +191,22 @@ export async function runTask(
         );
       },
     );
+    event.toolElapsedMs = Date.now() - toolStartedMs;
     event.toolResult = state.lastActionResult;
+    const observationAfter = buildObservation(bot, state.lastActionResult);
+    event.inventoryAfter = observationAfter.inventory;
+    event.scoreAfter = scoreTask(config.task, observationAfter);
     await writeRunLogSnapshot(logPath, config, startedAt, startedMs, events, state, bot, "running");
+
+    if (state.stopRequested || state.lastActionResult.error?.code === "stopped") {
+      finalStatus = "stopped";
+      break;
+    }
   }
 
-  finalScore = await writeRunLogSnapshot(logPath, config, startedAt, startedMs, events, state, bot, "complete");
+  finalScore = await writeRunLogSnapshot(logPath, config, startedAt, startedMs, events, state, bot, finalStatus);
 
-  return { logPath, score: finalScore };
+  return { logPath, score: finalScore, status: finalStatus };
 }
 
 async function writeRunLogSnapshot(
@@ -177,7 +217,7 @@ async function writeRunLogSnapshot(
   events: RunEvent[],
   state: { lastActionResult?: ToolResult },
   bot: Bot,
-  status: "running" | "complete",
+  status: "running" | "complete" | "stopped",
 ): Promise<TaskScore> {
   const finalObservation = buildObservation(bot, state.lastActionResult);
   const finalScore = scoreTask(config.task, finalObservation);

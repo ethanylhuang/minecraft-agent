@@ -36,6 +36,12 @@ export type ToolResult = {
   error?: StructuredError;
 };
 
+export type RunControlState = {
+  stopRequested: boolean;
+  stopReason?: string;
+  lastActionResult?: ToolResult;
+};
+
 export type SymbolicObservation = {
   health: number;
   food: number;

@@ -29,12 +29,13 @@ Useful environment variables:
 - `LLM_TIMEOUT_MS`, `TOOL_TIMEOUT_MS`
 - `ALLOW_SCRIPTED_FIXTURES` (`true` by default; set `false` for benchmark runs)
 - `TASK`, `MAX_ITERATIONS`, `LOG_DIR`
+- `RESET_COMMANDS`, `RESET_SPAWN`, `RESET_WAIT_TICKS`
 - `OPENAI_BASE_URL`, `OPENAI_API_KEY` (optional for local endpoints that do not require auth)
 - `GEMINI_BASE_URL`, `GEMINI_API_KEY`
 
 A local `.env` file is loaded automatically when present; keep secrets there rather than in commands.
 
-Equivalent CLI flags use kebab case: `--provider`, `--primary-model`, `--fallback-provider`, `--fallback-model`, `--model-escalation-order`, `--lock-fallback-after-use`, `--max-llm-retries`, `--llm-timeout-ms`, `--tool-timeout-ms`, `--allow-scripted-fixtures`, `--openai-base-url`, `--openai-api-key`, `--gemini-base-url`, `--gemini-api-key`, and benchmark-only `--gemma-failure-evidence` / `--run-timeout-ms`.
+Equivalent CLI flags use kebab case: `--provider`, `--primary-model`, `--fallback-provider`, `--fallback-model`, `--model-escalation-order`, `--lock-fallback-after-use`, `--max-llm-retries`, `--llm-timeout-ms`, `--tool-timeout-ms`, `--allow-scripted-fixtures`, `--reset-commands`, `--reset-spawn`, `--reset-wait-ticks`, `--openai-base-url`, `--openai-api-key`, `--gemini-base-url`, `--gemini-api-key`, and benchmark-only `--gemma-failure-evidence` / `--run-timeout-ms`.
 
 The default provider is deterministic `scripted`, which can progress early survival tasks through logs, planks, sticks, crafting table, and wooden pickaxe. It is a fixture/control for smoke and debug runs, not accepted M1 benchmark evidence. For benchmark evidence, run a real LLM provider first, normally an OpenAI-compatible Gemma 4 31B route, and escalate to a Gemini Flash-class route only after primary attempts are exhausted and logged.
 
@@ -96,6 +97,16 @@ npm run demo -- --mode llm --username webdemo --task early_sequence
 ```
 
 The demo opens a Prismarine viewer on `http://localhost:3007` and a dashboard on `http://localhost:3008`. The dashboard shows live inventory JSON, score state, LLM prompt/output/attempt trace, tool call/result records, and controls for running tasks, smoke plans, or individual tool calls.
+
+The dashboard also has `Stop Agent` and `Reset State` controls. Stop sets a shared cancellation flag, stops pathfinding, and leaves the active dashboard operation in a stopped state. Reset is manual-only and command-driven: by default it sends `/clear`, `/effect clear`, `/gamemode survival`, and optionally `/tp` when `--reset-spawn "x y z"` is configured. Add arena setup or cleanup commands with comma-separated `--reset-commands`, using `{username}`, `{x}`, `{y}`, and `{z}` placeholders when useful.
+
+Example controlled dashboard run:
+
+```sh
+npm run demo -- --mode smoke --auto-run=false --reset-spawn "0 64 0"
+```
+
+Use an opped bot or cheats-enabled local server for reset commands. Task, smoke, and manual tool runs do not reset automatically; press `Reset State` only when you explicitly want to clear or rebuild the world state.
 
 Use the deterministic smoke plan instead of the LLM loop with:
 
